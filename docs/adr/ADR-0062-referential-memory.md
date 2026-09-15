@@ -149,6 +149,32 @@ for is not at risk.
   memory's `authority` is other-assertable. Referential memories may be
   *rendered* before this lands. A consumer may not *route* on one.
 
+## Evidence gathered after filing (2026-09-15, same night)
+
+The encoder flip (#961) went live on O1 and made a direct measurement of the
+store possible. Two results bear on this ADR (numbers and method in #963):
+
+1. **The medium is not the collapse.** The same 228 text memories embedded
+   fresh in raw 384-d give `d_eff` 16.08; after the 384→10k codebook they give
+   15.97 — ×0.99, lossless. Whatever superposition does *semantically* to a
+   scalar (§2 above), the projection loses nothing representationally. This
+   ADR's argument is about the operation, not the encoding, and the measurement
+   leaves it where it stood.
+
+2. **The purest unanchored claims in the store are dream hallucinations.** 183
+   rows at `d_eff` 3.08 carry 75% of the Gram mass; before the flip, ten
+   near-colinear syntheses of one source answered four of five unrelated recall
+   probes. They are born in consolidation and refer to nothing outside the
+   medium, and consolidation is recursing on its own output. Open question 2
+   below is therefore not hypothetical: the resonant layer is already
+   manufacturing claims with no authority, at scale.
+
+A hypothesis formed on air and falsified afterwards, recorded so it is not
+re-derived: the IonQ job id kannaka-prime could not verify is **not** a dream
+artifact — it lives in two non-hallucinated records. It is a real memory of an
+unverifiable claim: a job id is a fetchable authority that was never fetched.
+That is this ADR's case exactly, but for that reason and not the other.
+
 ## Open questions
 
 1. **Who decides the kind at write time** — the operator, the `remember` caller,
