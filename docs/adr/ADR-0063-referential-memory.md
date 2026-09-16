@@ -1,4 +1,4 @@
-# ADR-0062: Referential memory — a fact that has an authority must not be held as a wave
+# ADR-0063: Referential memory — a fact that has an authority must not be held as a wave
 
 **Status:** Proposed
 **Date:** 2026-09-15
