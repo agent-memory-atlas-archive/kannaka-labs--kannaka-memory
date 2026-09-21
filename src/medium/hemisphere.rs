@@ -129,6 +129,59 @@ impl Drop for SuppressTemporalScoring {
     }
 }
 
+/// Sentinel for "no as-of pin set": fall back to the wall clock.
+const RECALL_AS_OF_UNSET: i64 = i64::MIN;
+
+/// Millisecond timestamp recall scores against; see [`RecallAsOf`].
+static RECALL_AS_OF_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(RECALL_AS_OF_UNSET);
+
+/// The instant temporal scoring treats as "now".
+///
+/// Wall clock unless a [`RecallAsOf`] guard is in scope. Every temporal weight
+/// in one recall reads this once, so a single recall stays internally
+/// consistent.
+pub fn recall_now() -> chrono::DateTime<chrono::Utc> {
+    match RECALL_AS_OF_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        RECALL_AS_OF_UNSET => chrono::Utc::now(),
+        ms => chrono::DateTime::from_timestamp_millis(ms).unwrap_or_else(chrono::Utc::now),
+    }
+}
+
+/// RAII guard pinning [`recall_now`] to a chosen instant for its lifetime.
+///
+/// Why this exists: temporal weight decays from `observed_at` to *now*, and
+/// `0.5^(age/half_life)` is clamped up to the superseded floor. That clamp
+/// binds at two half-lives — 360 days at the default — so on a store older
+/// than that, every candidate returns the floor and the temporal factor
+/// degrades into a constant multiplier that cannot reorder anything. It does
+/// not fail; it just stops doing its job, silently, and lowering the floor
+/// only moves the constant.
+///
+/// Pinning "now" to the time the question is actually about restores the
+/// signal, and is the honest question anyway: an agent asking "what did we use
+/// last March?" wants recency measured from March.
+///
+/// Restores the previous value on drop, so nesting is safe and an early return
+/// or a panic cannot leave recall pinned to a stale instant.
+pub struct RecallAsOf(i64);
+
+impl RecallAsOf {
+    pub fn new(at: chrono::DateTime<chrono::Utc>) -> Self {
+        let prev = RECALL_AS_OF_MS.swap(
+            at.timestamp_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Self(prev)
+    }
+}
+
+impl Drop for RecallAsOf {
+    fn drop(&mut self) {
+        RECALL_AS_OF_MS.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Half-life in days for confirmation-recency decay
 /// (`KANNAKA_RECALL_TEMPORAL_HALFLIFE_DAYS`, default 180).
 ///
@@ -165,6 +218,10 @@ pub fn recall_temporal_floor() -> f32 {
         .unwrap_or(TEMPORAL_SUPERSEDED_FLOOR)
 }
 
+/// How far ahead of the scoring instant an `observed_at` may sit before the
+/// memory counts as "not yet observed" rather than clock skew between hosts.
+pub const OBSERVATION_SKEW_TOLERANCE_SECS: i64 = 300;
+
 /// Confirmation-recency weight for one wavefront, in `(0, 1]`.
 ///
 /// - Not currently true (`Expired` / `Future`) → [`TEMPORAL_SUPERSEDED_FLOOR`].
@@ -192,6 +249,22 @@ pub fn temporal_weight(
         }
     }
     let confirmed = meta.observed_at.unwrap_or(meta.created_at);
+    // Observed AFTER the instant being scored → floor, not "brand new".
+    //
+    // `max(0)` below clamps a negative age to zero, which reads as maximal
+    // freshness. Against the wall clock that is unreachable; under `RecallAsOf`
+    // it is not, and it inverts the ranking — scoring as of February, a claim
+    // observed in May came back weight 1.0, ahead of everything actually known
+    // in February. A fact not yet observed is the same case as one not yet in
+    // force, so it gets the same answer the `effective_at` check gives.
+    //
+    // The tolerance is for clock skew between synced hosts: a freshly gossiped
+    // memory can carry an `observed_at` a few seconds ahead of the local clock,
+    // and flooring a genuinely current fact over that would be worse than the
+    // bug being fixed. It is orders of magnitude below any real as-of gap.
+    if (confirmed - now).num_seconds() > OBSERVATION_SKEW_TOLERANCE_SECS {
+        return floor;
+    }
     let age_days = (now - confirmed).num_seconds().max(0) as f32 / 86_400.0;
     let w = 0.5f32.powf(age_days / half_life_days.max(1e-3));
     // Clamp above the floor: a merely OLD but still-true fact must never rank
@@ -468,9 +541,10 @@ impl Hemisphere {
         };
 
         // Temporal weight. One `now` for the whole call so a single recall is
-        // internally consistent (and deterministic under test).
+        // internally consistent (and deterministic under test) — the wall clock
+        // unless a `RecallAsOf` guard pins it to the time the query is about.
         let temporal_on = temporal_exp > 0.0;
-        let now = chrono::Utc::now();
+        let now = recall_now();
         let floor = if temporal_on { recall_temporal_floor() } else { TEMPORAL_SUPERSEDED_FLOOR };
         let tweight = |i: usize| -> f32 {
             if !temporal_on { return 1.0; }
@@ -1285,6 +1359,190 @@ mod tests {
 
     /// The superseded floor is never zero, and a merely-old-but-still-true fact
     /// never sinks below an explicitly expired one.
+    // ── RecallAsOf: scoring as of a query time ───────────────────────────
+
+    #[test]
+    fn recall_now_is_the_wall_clock_until_pinned_and_again_after() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use chrono::{Duration, TimeZone, Utc};
+
+        let before = recall_now();
+        assert!(
+            (Utc::now() - before).num_seconds().abs() < 5,
+            "unpinned, recall_now must be the wall clock"
+        );
+
+        let pinned = Utc.with_ymd_and_hms(2023, 5, 2, 0, 0, 0).unwrap();
+        {
+            let _g = RecallAsOf::new(pinned);
+            assert_eq!(recall_now(), pinned, "pinned inside the scope");
+        }
+        assert!(
+            (Utc::now() - recall_now()).num_seconds().abs() < 5,
+            "a leaked pin would freeze temporal scoring at a stale instant for \
+             every later recall in the process"
+        );
+        let _ = Duration::days(1);
+    }
+
+    #[test]
+    fn recall_as_of_nests_and_restores_what_it_found() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use chrono::{TimeZone, Utc};
+
+        let outer_at = Utc.with_ymd_and_hms(2023, 5, 2, 0, 0, 0).unwrap();
+        let inner_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let _outer = RecallAsOf::new(outer_at);
+        {
+            let _inner = RecallAsOf::new(inner_at);
+            assert_eq!(recall_now(), inner_at);
+        }
+        assert_eq!(
+            recall_now(),
+            outer_at,
+            "the inner scope must restore the OUTER pin, not the wall clock"
+        );
+    }
+
+    #[test]
+    fn recall_as_of_restores_even_when_the_scope_unwinds() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use chrono::{TimeZone, Utc};
+
+        let pinned = Utc.with_ymd_and_hms(2023, 5, 2, 0, 0, 0).unwrap();
+        // Record inside, panic, assert outside — asserting inside the closure
+        // would make the test self-satisfying, since a failed assertion is
+        // itself the panic `is_err` checks for.
+        let seen = std::sync::Mutex::new(None);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = RecallAsOf::new(pinned);
+            *seen.lock().unwrap() = Some(recall_now());
+            panic!("recall blew up mid-scan");
+        }));
+        assert!(r.is_err(), "the panic is the point of the test");
+        assert_eq!(*seen.lock().unwrap(), Some(pinned), "the pin was in force");
+        assert!(
+            (chrono::Utc::now() - recall_now()).num_seconds().abs() < 5,
+            "Drop must run on unwind, or one failed recall pins the process forever"
+        );
+    }
+
+    /// THE reason `--at` exists.
+    ///
+    /// `temporal_weight` decays from `observed_at` to *now* and clamps the
+    /// result up to the superseded floor. That clamp binds at two half-lives
+    /// (360 days by default), so on a store whose contents are older than that
+    /// — a 2023 corpus read in 2026, say — every candidate returns exactly the
+    /// floor. The factor becomes a CONSTANT multiplier: it cannot reorder
+    /// anything, it does not fail, and nothing reports it. Measured on
+    /// longmemeval: flag off and flag on gave byte-identical rankings.
+    ///
+    /// Scoring as of the time the question is about restores the signal.
+    #[test]
+    fn as_of_restores_temporal_ranking_that_the_floor_clamp_had_flattened() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use chrono::{Duration, TimeZone, Utc};
+
+        let mut hemi = Hemisphere::new(Hand::Left, 64);
+
+        // Two equally-similar claims, observed three months apart in 2023 —
+        // the shape of a real recorded corpus. Similarity cannot separate
+        // them, so only the temporal factor can.
+        let base: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin()).collect();
+        let old_vec: Vec<f32> = base.iter().map(|v| v + 0.02).collect();
+        let new_vec: Vec<f32> = base.iter().map(|v| v - 0.02).collect();
+        let old_id = hemi.add_wavefront(&old_vec, "target is oracle-one".into(), 1.0).unwrap();
+        let new_id = hemi.add_wavefront(&new_vec, "target is oracle-three".into(), 1.0).unwrap();
+
+        let feb = Utc.with_ymd_and_hms(2023, 2, 1, 0, 0, 0).unwrap();
+        let may = Utc.with_ymd_and_hms(2023, 5, 1, 0, 0, 0).unwrap();
+        for m in hemi.metadata.iter_mut() {
+            if m.id == old_id {
+                m.observed_at = Some(feb);
+            } else if m.id == new_id {
+                m.observed_at = Some(may);
+            }
+        }
+
+        let floor = TEMPORAL_SUPERSEDED_FLOOR;
+
+        // Against the wall clock both are ~2 years old, past the clamp point,
+        // so both pin to the floor and the factor is a constant.
+        let wall = chrono::Utc::now();
+        let w_old = temporal_weight(
+            hemi.metadata.iter().find(|m| m.id == old_id).unwrap(), wall, 180.0, floor);
+        let w_new = temporal_weight(
+            hemi.metadata.iter().find(|m| m.id == new_id).unwrap(), wall, 180.0, floor);
+        assert!(wall - may > Duration::days(360), "the premise: the corpus is past the clamp");
+        assert_eq!(w_old, floor);
+        assert_eq!(w_new, floor);
+        assert_eq!(w_old, w_new, "flattened: a constant cannot rank anything");
+
+        // As of the day after the newer claim, the two separate, both ABOVE
+        // the floor — the factor discriminates again.
+        let asked = Utc.with_ymd_and_hms(2023, 5, 2, 0, 0, 0).unwrap();
+        let _pin = RecallAsOf::new(asked);
+        assert_eq!(recall_now(), asked);
+        let a_old = temporal_weight(
+            hemi.metadata.iter().find(|m| m.id == old_id).unwrap(), recall_now(), 180.0, floor);
+        let a_new = temporal_weight(
+            hemi.metadata.iter().find(|m| m.id == new_id).unwrap(), recall_now(), 180.0, floor);
+        assert!(a_new > a_old, "the recently-confirmed claim must weigh more");
+        assert!(a_old > floor, "and neither may be pinned to the floor");
+
+        // End to end through the ranking path the CLI uses.
+        let ranked = hemi.resonate_with_weights(&base, 2, 1.0, 1.0, 180.0);
+        assert_eq!(
+            ranked[0].id, new_id,
+            "as of the question's date, the newer claim outranks the older one"
+        );
+        assert!(
+            ranked.iter().any(|r| r.id == old_id),
+            "and the older one stays retrievable — demotion, not deletion"
+        );
+    }
+
+    /// Scoring as of a past instant must not rank a LATER memory as freshest.
+    ///
+    /// The age clamp (`max(0)`) reads a negative age as zero — maximal
+    /// recency. Unreachable against a wall clock, reachable through `--at`,
+    /// and it inverts the answer: asked "what did we use in February", the
+    /// system replied with the value adopted in May, ranked top.
+    #[test]
+    fn a_memory_observed_after_the_as_of_instant_is_floored_not_freshest() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use chrono::{Duration, TimeZone, Utc};
+
+        let feb = Utc.with_ymd_and_hms(2023, 2, 1, 0, 0, 0).unwrap();
+        let may = Utc.with_ymd_and_hms(2023, 5, 1, 0, 0, 0).unwrap();
+        let asked = Utc.with_ymd_and_hms(2023, 2, 2, 0, 0, 0).unwrap();
+        let floor = TEMPORAL_SUPERSEDED_FLOOR;
+
+        let mut known = WavefrontMeta::new(Uuid::new_v4(), "known in february".into());
+        known.observed_at = Some(feb);
+        let mut later = WavefrontMeta::new(Uuid::new_v4(), "adopted in may".into());
+        later.observed_at = Some(may);
+
+        let w_known = temporal_weight(&known, asked, 180.0, floor);
+        let w_later = temporal_weight(&later, asked, 180.0, floor);
+
+        assert_eq!(w_later, floor, "a not-yet-observed memory must be floored");
+        assert!(
+            w_known > w_later,
+            "what was actually known must outrank what had not happened yet"
+        );
+
+        // Clock skew is NOT a future observation: a memory a few seconds ahead
+        // of the scoring instant must stay fresh, not drop to the floor.
+        let mut skewed = WavefrontMeta::new(Uuid::new_v4(), "just gossiped in".into());
+        skewed.observed_at = Some(asked + Duration::seconds(OBSERVATION_SKEW_TOLERANCE_SECS - 30));
+        let w_skew = temporal_weight(&skewed, asked, 180.0, floor);
+        assert!(
+            w_skew > 0.99,
+            "a few seconds of host skew must not demote a current fact to the floor"
+        );
+    }
+
     #[test]
     fn temporal_weight_floors_and_orders_correctly() {
         use chrono::{Duration, Utc};
