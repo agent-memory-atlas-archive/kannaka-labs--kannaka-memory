@@ -165,6 +165,10 @@ fn run(s: &Scratch, extra_env: &[(&str, &str)]) -> i32 {
         std::env::var("PATH").unwrap_or_default()
     );
     let mut cmd = Command::new("bash");
+    // `cargo test` exports CARGO (and often CARGO_HOME) into the test process.
+    // The cron has neither, and leaving them set would let find_cargo succeed
+    // through a door production does not have.
+    cmd.env_remove("CARGO").env_remove("CARGO_HOME");
     cmd.arg(&script)
         .env("PATH", path)
         .env("AUTORESEARCH_REPO", s.repo())
@@ -180,9 +184,134 @@ fn run(s: &Scratch, extra_env: &[(&str, &str)]) -> i32 {
     cmd.output().expect("run cron").status.code().unwrap_or(-1)
 }
 
+/// Put a stub `id` on PATH so the root-refusal branch can be exercised without
+/// a root runner. The script resolves `id` on PATH for exactly this reason.
+fn stub_id_as_root(s: &Scratch) {
+    write_exec(
+        &s.bin().join("id"),
+        "#!/bin/sh\nif [ \"$1\" = \"-u\" ]; then echo 0; else /usr/bin/id \"$@\"; fi\n",
+    );
+}
+
 const GOOD_RESEARCH: &str = "#!/bin/sh\necho 'fitness:              0.130145'\n";
 const FAILING_RESEARCH: &str =
     "#!/bin/sh\necho 'ld: cannot open shared object file' >&2\nexit 101\n";
+
+#[test]
+fn running_as_root_is_refused_before_the_checkout_is_touched() {
+    // O1's crontab reached this script through `sudo systemd-run --scope`, so
+    // it ran as uid 0 and its `git reset --hard` rewrote an opc-owned checkout
+    // as root — 176 working-tree files and 991 objects under .git by the time
+    // a plain `git pull` started failing with "Permission denied".
+    let s = scratch(GOOD_RESEARCH, 0);
+    stub_id_as_root(&s);
+
+    let code = run(&s, &[]);
+    let log = s.log();
+
+    assert_eq!(code, 1, "running as root must abort\n{log}");
+    assert!(
+        log.contains("REFUSING to run as root"),
+        "the refusal must name the problem:\n{log}"
+    );
+    assert!(
+        log.contains("--uid="),
+        "and must name the fix, since the memory cap is why sudo was there:\n{log}"
+    );
+    assert!(
+        !log.contains("--- baseline ---"),
+        "it must refuse BEFORE doing any work on the checkout:\n{log}"
+    );
+}
+
+#[test]
+fn an_explicitly_root_owned_checkout_may_opt_in() {
+    // A root-owned checkout is a legitimate configuration; the guard is about
+    // the accident, not the arrangement. Without this, the refusal would be
+    // untestable in the direction that matters — that it can be turned off.
+    let s = scratch(GOOD_RESEARCH, 0);
+    stub_id_as_root(&s);
+
+    let code = run(&s, &[("OODA_ALLOW_ROOT", "1")]);
+    let log = s.log();
+
+    assert!(
+        !log.contains("REFUSING to run as root"),
+        "OODA_ALLOW_ROOT=1 must lift the refusal:\n{log}"
+    );
+    assert_eq!(code, 0, "and the cycle should then run normally\n{log}");
+}
+
+/// Move the cargo stub off PATH and into a scratch `$HOME/.cargo/bin`, the way
+/// rustup installs it. Returns the HOME to run with.
+fn hide_cargo_in_home(s: &Scratch) -> PathBuf {
+    let home = s.root.join("home");
+    fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+    fs::rename(s.bin().join("cargo"), home.join(".cargo/bin/cargo")).unwrap();
+    home
+}
+
+/// PATH with nothing of ours on it — enough to run the script, no cargo.
+fn bare_path(s: &Scratch) -> String {
+    format!("{}:/usr/bin:/bin", s.bin().display())
+}
+
+#[test]
+fn cargo_is_found_by_path_when_a_scope_strips_it_from_path() {
+    // THE 126-night failure. A systemd-run scope inherits
+    // PATH=/sbin:/bin:/usr/sbin:/usr/bin, and rustup puts cargo in
+    // ~/.cargo/bin, which only a login profile adds. `cargo run` exited 127
+    // with "No such file or directory" and `2>/dev/null` ate the sentence.
+    let s = scratch(GOOD_RESEARCH, 0);
+    make_binary_stale(&s);
+    let home = hide_cargo_in_home(&s);
+
+    let code = run(
+        &s,
+        &[
+            ("OODA_ALLOW_BUILD", "1"),
+            ("PATH", &bare_path(&s)),
+            ("HOME", &home.display().to_string()),
+        ],
+    );
+    let log = s.log();
+
+    assert!(
+        !log.contains("CANNOT BUILD"),
+        "cargo under $HOME/.cargo/bin must be found even when PATH lacks it:\n{log}"
+    );
+    assert!(
+        s.cargo_calls().contains("build --release --bin research"),
+        "and must actually be invoked; cargo saw: {:?}",
+        s.cargo_calls()
+    );
+    assert_eq!(code, 0, "the cycle should then complete\n{log}");
+}
+
+#[test]
+fn a_genuinely_absent_cargo_says_so_instead_of_failing_blank() {
+    let s = scratch(GOOD_RESEARCH, 0);
+    make_binary_stale(&s);
+    fs::remove_file(s.bin().join("cargo")).unwrap();
+    let empty_home = s.root.join("empty-home");
+    fs::create_dir_all(&empty_home).unwrap();
+
+    let code = run(
+        &s,
+        &[
+            ("OODA_ALLOW_BUILD", "1"),
+            ("PATH", &bare_path(&s)),
+            ("HOME", &empty_home.display().to_string()),
+        ],
+    );
+    let log = s.log();
+
+    assert_eq!(code, 1, "a missing cargo must fail the run\n{log}");
+    assert!(
+        log.contains("CANNOT BUILD") && log.contains("not on PATH"),
+        "the failure must name the missing tool, not print nothing:\n{log}"
+    );
+}
 
 #[test]
 fn a_stale_binary_aborts_loudly_instead_of_building_inside_the_cron() {
