@@ -475,7 +475,35 @@ impl HrmStore {
     }
 
     /// Create a new HRM store with the given encoding pipeline and file path.
+    ///
+    /// Chiral from birth (#917, #1031). A fresh store used to start FLAT and
+    /// only became chiral on its next load (`ChiralMedium::load` converts a v1
+    /// file), so the shape of a store depended on how many processes had
+    /// touched it: twenty `kannaka remember` calls saved and reloaded between
+    /// each insert and produced a v2 store with 61 rows, while one
+    /// `remember --batch` of the same twenty lines never reloaded, stayed on
+    /// the flat branch of `absorb`, minted no facets, and produced a v1 store
+    /// with 20 rows — paying `apply_interference` over the whole medium on
+    /// every insert as well (0.797·n ms/item; 16× slower than chiral at
+    /// n=2400). Same input, different store. Nick ruled that an ingest
+    /// correctness bug, not a benchmark artifact.
+    ///
+    /// The medium is built by `from_medium` on an empty `Medium`, which is
+    /// exactly what a v1→v2 conversion on load produces, so a store that was
+    /// never reloaded is now byte-for-byte the shape of one that was. The
+    /// legacy flat medium is still reachable through [`Self::new_flat`] for
+    /// tests of the v1 path and of `upgrade_to_chiral` itself.
     pub fn new(pipeline: EncodingPipeline, hrm_path: PathBuf) -> Self {
+        let mut store = Self::new_flat(pipeline, hrm_path);
+        store.chiral = Some(ChiralMedium::from_medium(&store.medium));
+        store
+    }
+
+    /// Create a new store on the legacy FLAT (v1) medium. Production never
+    /// takes this path since #1031: it exists so tests can still exercise the
+    /// flat branch of `absorb`/recall and the flat→chiral upgrade. A flat
+    /// store saves as v1 and converts to chiral on its next load.
+    pub fn new_flat(pipeline: EncodingPipeline, hrm_path: PathBuf) -> Self {
         Self {
             medium: Medium::new(),
             chiral: None,
@@ -619,6 +647,8 @@ impl HrmStore {
     /// Leave bulk mode and rebuild the cache once for everything absorbed.
     pub fn end_bulk(&mut self) -> Result<(), StoreError> {
         BULK_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+        // #1031: one flat-view sync for the whole batch, then one cache rebuild.
+        self.sync_medium_from_chiral();
         self.rebuild_cache()?;
         self.mark_dirty();
         Ok(())
@@ -1192,6 +1222,10 @@ impl HrmStore {
             self.medium.add_wavefront(&vector, content.clone(), importance)
                 .map_err(|e| StoreError::Other(format!("add_wavefront failed: {e}")))?
         };
+        if self.chiral.is_some() {
+            // #1031: keep the flat view current for its remaining readers.
+            self.sync_medium_from_chiral();
+        }
         // The medium has the wavefront for tensor/vector math, but the
         // higher-level `all_memories()` / `assess()` paths read from
         // `memory_cache`. Insert a matching HyperMemory record so
@@ -1214,13 +1248,28 @@ impl HrmStore {
 
     /// Ensure the flat medium is populated from chiral state (for backward compat).
     /// Call this before operations that need the flat medium view.
+    ///
+    /// #1031: this used to fill the flat view only when it was EMPTY, which made
+    /// it a load-time snapshot — every right-hemisphere row written afterwards
+    /// in the same process was invisible to the readers that still consult the
+    /// flat view (`consciousness_metrics`, `find_associated`, the legacy
+    /// `recall_resonance`, the queen's phase derivation, `apply_consolidation`).
+    /// That was survivable only because a fresh store started flat and became
+    /// chiral on reload. With a store chiral from birth the flat view would
+    /// start empty and stay empty, so this now appends every right row the
+    /// flat view lacks, by id, and is called after each chiral write (once per
+    /// bulk load, in `end_bulk`). Rows are raw appends — no interference pass —
+    /// so it costs one id lookup per row, not the flat medium's O(n) insert.
     pub fn sync_medium_from_chiral(&mut self) {
         if let Some(ref chiral) = self.chiral {
-            if self.medium.wavefront_count() == 0 && chiral.right.count() > 0 {
-                // Build flat medium from right hemisphere
+            if chiral.right.count() > 0 {
+                // Append the right-hemisphere rows the flat view lacks
                 for i in 0..chiral.right.count() {
-                    let vector = chiral.right.wavefronts.row(i).to_vec();
                     let meta = &chiral.right.metadata[i];
+                    if self.medium.get_wavefront_index(&meta.id).is_some() {
+                        continue;
+                    }
+                    let vector = chiral.right.wavefronts.row(i).to_vec();
                     let _ = self.medium.add_wavefront(
                         &vector,
                         meta.content.clone(),
@@ -2783,6 +2832,8 @@ impl MediumBackend for HrmStore {
             // otherwise gain ungated control of `expires_at` (floor any memory of
             // ours) and `tier` (pin memories in our store). That change lands WITH
             // the sanitization, not before it. See ADR-0051.
+            // #1031: keep the flat view current for its remaining readers.
+            self.sync_medium_from_chiral();
         } else {
             // Flat-medium path, unchanged.
             let wavefront_id = self.medium.add_wavefront(&memory.vector, memory.content.clone(), memory.amplitude)
@@ -3025,6 +3076,9 @@ impl MediumBackend for HrmStore {
             let id = chiral.store_with_facets(content, importance, &self.pipeline, category)
                 .map_err(|e| StoreError::Other(format!("chiral store failed: {e}")))?;
             if !BULK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                // #1031: the parent and its facets also join the flat view;
+                // in bulk mode `end_bulk` does this once.
+                self.sync_medium_from_chiral();
                 self.rebuild_cache().ok();
             }
             self.mark_dirty();
@@ -3342,6 +3396,74 @@ mod tests {
     // #107: recompute_encoding re-encodes chiral wavefronts in place. dry-run
     // reports the counts without writing; a real run rewrites the corrupted right
     // vector to match a fresh encoding of the same content.
+    /// #917 / #1031: a store must be the same store whether one process built
+    /// it or twenty did. Before the fix `HrmStore::new` was flat, and only a
+    /// save+reload converted it, so `remember --batch` (one process, never
+    /// reloaded) took the flat branch of `absorb`: no facets, v1 on disk,
+    /// O(n²) ingest. The flat control here is that measured shape — one row
+    /// from a compound sentence — and it is what a fresh `new` produced
+    /// before this test existed (mutation-checked: swap `new` for `new_flat`
+    /// in the second half and the facet assertion fails).
+    #[test]
+    fn a_fresh_store_is_chiral_and_mints_facets_before_any_reload() {
+        let _on = crate::facet::decompose_for_test(true);
+        const COMPOUND: &str = "The harbor beacon channel moved to twentyseven last spring. \
+            The lighthouse keeper still logs every crossing by hand. \
+            Gulls avoid the eastern pier when the foghorn is running.";
+        assert!(
+            crate::facet::decompose(COMPOUND).len() >= 2,
+            "fixture no longer decomposes"
+        );
+        fn magic_of(path: &std::path::Path) -> [u8; 4] {
+            use std::io::Read;
+            let mut m = [0u8; 4];
+            std::fs::File::open(path).unwrap().read_exact(&mut m).unwrap();
+            m
+        }
+
+        // Control: the legacy flat medium, the shape #1031 measured on disk.
+        let flat_rows = {
+            let temp = NamedTempFile::new().unwrap();
+            let mut flat = HrmStore::new_flat(make_test_pipeline(), temp.path().to_path_buf());
+            assert!(!flat.is_chiral(), "control must start flat");
+            flat.absorb(COMPOUND, 0.5, None).unwrap();
+            flat.flush().unwrap();
+            assert_eq!(magic_of(temp.path()), [0x48, 0x52, 0x4D, 0x01], "flat saves as v1");
+            flat.count()
+        };
+        assert_eq!(flat_rows, 1, "control: the flat branch stores one undecomposed row");
+
+        // The production constructor: chiral before the first insert.
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let rows = {
+            let mut store = HrmStore::new(make_test_pipeline(), path.clone());
+            assert!(store.is_chiral(), "a fresh store must be chiral before its first insert");
+            store.absorb(COMPOUND, 0.5, None).unwrap();
+            let rows = store.chiral_medium().unwrap().right.count();
+            assert!(
+                rows >= 3,
+                "fresh store minted no facets: {rows} row(s), same as the flat control ({flat_rows})"
+            );
+            store.flush().unwrap();
+            assert_eq!(
+                magic_of(&path),
+                crate::medium::types::HRM_MAGIC_V2,
+                "the FIRST save of a fresh store must already be v2"
+            );
+            rows
+        };
+
+        // A reload has no conversion left to do: the shape is unchanged.
+        let reloaded = HrmStore::load(make_test_pipeline(), path).unwrap();
+        assert!(reloaded.is_chiral());
+        assert_eq!(
+            reloaded.chiral_medium().unwrap().right.count(),
+            rows,
+            "reload changed the row count — a conversion still happens on load"
+        );
+    }
+
     #[test]
     fn recompute_encoding_chiral_fixes_vectors() {
         let temp = NamedTempFile::new().unwrap();
@@ -3463,7 +3585,7 @@ mod tests {
     fn recall_observation_can_be_switched_off_on_both_paths() {
         for chiral in [true, false] {
             let temp_file = NamedTempFile::new().unwrap();
-            let mut store = HrmStore::new(make_test_pipeline(), temp_file.path().to_path_buf());
+            let mut store = HrmStore::new_flat(make_test_pipeline(), temp_file.path().to_path_buf());
             if chiral { store.upgrade_to_chiral(); }
             store.insert(HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "an observed memory".to_string())).unwrap();
             store.flush().unwrap();
@@ -3550,7 +3672,7 @@ mod tests {
         const BATCHES: usize = 8;
         for chiral in [true, false] {
             let temp_file = NamedTempFile::new().unwrap();
-            let mut store = HrmStore::new(make_test_pipeline(), temp_file.path().to_path_buf());
+            let mut store = HrmStore::new_flat(make_test_pipeline(), temp_file.path().to_path_buf());
             if chiral { store.upgrade_to_chiral(); }
             let mut n = 0usize;
             let mut first: Option<u128> = None;
@@ -3579,7 +3701,7 @@ mod tests {
             let temp_file = NamedTempFile::new().unwrap();
             let path = temp_file.path().to_path_buf();
             let hot_id = {
-                let mut store = HrmStore::new(make_test_pipeline(), path.clone());
+                let mut store = HrmStore::new_flat(make_test_pipeline(), path.clone());
                 if chiral { store.upgrade_to_chiral(); }
                 let mut hot = HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "remembered at amplitude 8.5".to_string());
                 hot.amplitude = 8.5;
@@ -3936,6 +4058,10 @@ mod tests {
     /// Build a flat (non-chiral) store and insert a wavefront with full control
     /// over vector / energy / phase / tier directly in the authoritative store.
     /// Returns the assigned UUID. Caller should `rebuild_cache()` afterward.
+    // Writes straight into the FLAT medium (controlled energy/phase/tier), so
+    // its callers build the store with `new_flat` — on a chiral store these rows
+    // would live only in the flat view and `rebuild_cache` would not see them
+    // (#1031). `apply_chiral_map_consistency` covers the chiral apply path.
     fn insert_ctl(
         store: &mut HrmStore,
         vector: Vec<f32>,
@@ -3975,7 +4101,7 @@ mod tests {
     #[test]
     fn apply_holographic_preservation() {
         // N near-duplicate, phase-locked memories + some unrelated ones.
-        let mut store = HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
 
         // Cluster: 3 near-identical vectors (cos ~ 1.0), phase 0 (locked).
         let base = vec![0.5f32; WAVEFRONT_DIM];
@@ -4037,7 +4163,7 @@ mod tests {
         // member's link OUT is inherited by the carrier. Regression for the
         // dropped/dangling-connection gap on the ADR-0036 destructive path.
         let mut store =
-            HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+            HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
 
         // Merge group of 3 near-identical, phase-locked dups. dup[0] is strongest
         // so it is deterministically the carrier; dup[1]/dup[2] are absorbed.
@@ -4097,7 +4223,7 @@ mod tests {
 
     #[test]
     fn apply_pinned_and_longterm_protected() {
-        let mut store = HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
 
         // A Pinned duplicate pair — Pinned must never be grouped/removed.
         let base = vec![0.5f32; WAVEFRONT_DIM];
@@ -4139,7 +4265,7 @@ mod tests {
     fn apply_longterm_never_evicted() {
         // A low-energy LongTerm with no reactivation must NOT be evicted (only
         // ShortTerm is eviction-eligible).
-        let mut store = HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
         let mut v = vec![0.0f32; WAVEFRONT_DIM]; v[42] = 1.0;
         let lt = insert_ctl(&mut store, v, "weak long", 0.01, 0.0, Tier::LongTerm, 0);
         let report = store.apply_consolidation(&apply_opts());
@@ -4149,7 +4275,7 @@ mod tests {
 
     #[test]
     fn apply_shortterm_evict_respects_reactivation() {
-        let mut store = HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
         // Below threshold, unreactivated -> evicted.
         let mut v1 = vec![0.0f32; WAVEFRONT_DIM]; v1[10] = 1.0;
         let evicted = insert_ctl(&mut store, v1, "cold short", 0.05, 0.0, Tier::ShortTerm, 0);
@@ -4165,7 +4291,7 @@ mod tests {
 
     #[test]
     fn apply_is_idempotent_second_run_absorbs_zero() {
-        let mut store = HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
         let base = vec![0.5f32; WAVEFRONT_DIM];
         for k in 0..4 {
             let mut v = base.clone(); v[k] += 0.001;
@@ -4565,7 +4691,7 @@ mod tests {
     #[test]
     fn apply_absorb_cap_bounds_over_merge() {
         let mut store =
-            HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+            HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
         // Three orthogonal clusters of 3 near-identical LongTerm memories each
         // (9) + one unrelated survivor = 10. All 3 clusters WOULD merge (absorb 6).
         for cluster in 0..3usize {
@@ -4603,7 +4729,7 @@ mod tests {
     #[test]
     fn dryrun_apply_parity() {
         let build = || {
-            let mut store = HrmStore::new(
+            let mut store = HrmStore::new_flat(
                 make_test_pipeline(),
                 NamedTempFile::new().unwrap().path().to_path_buf(),
             );
