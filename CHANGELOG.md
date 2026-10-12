@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.16.16] — 2026-10-12
+
+### A store save never leaves its temp file behind, and orphaned temps are swept before the save as well as after (#1111)
+
+A save writes `<store>.tmp.<pid>.<nanos>` and renames it into place. Every `?` between create and rename returned with the temp still on disk, and the sweep of old temps ran only after a successful save. On debain2 that made a full disk self-perpetuating: a 2.2 GB store whose writers are killed at a 30 s timeout left a 2.2 GB orphan per kill, and once the disk filled no save succeeded, so nothing was ever swept (2026-10-10 to 10-12: about 41.6 hours, every citizen's cycle failing ENOSPC). `fs_util::TmpGuard` now removes the temp on every error path unless the rename succeeded, and `fs_util::sweep_stale_tmps` runs before the write too, with the same 5-minute floor (a fresh temp may be another writer's save in flight), so a disk filled by orphans recovers on the next save. The v1 save in `medium/persistence.rs`, which had no sweep, gets the same treatment, and the chiral save's inline sweep now calls the shared helper. A signal kill skips `Drop`, so a killed writer's temp is still left until the next save's sweep. Tests: the guard removes unless disarmed; the sweep takes old orphans of this file only. Three single mutants killed.
+
+### A malformed networked recall reply is an error, not `[]` with exit 0 (#1077); two dream/hive allocations removed (#879, #883)
+
+`recall --remote` needs an object with a `results` array and `--collective` needs JSON; anything else names the subject and what was wrong on stderr and exits 3. An empty `results` array still prints `[]`. `stage_detect` reads the source memory once per working-set entry instead of re-fetching it twice per neighbour, and hive cohesion is one fold with no temporary `Vec`; nothing in either loop writes the store, so the values are the same.
+
 ### `--help` never runs a command; QUEEN_EVENTS stores the events it is named for
 
 - A passthrough subcommand swallowed `--help` after its first token and the handler ran the command: `kannaka swarm join --help` joined the swarm, `kannaka events restore --help` restored. `cli::parse` now prints that subcommand's help and stops when `--help` or `-h` appears anywhere in its arguments (a bare `help` is still text).
